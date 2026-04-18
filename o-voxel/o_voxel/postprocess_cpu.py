@@ -17,6 +17,7 @@ from PIL import Image
 import trimesh
 import trimesh.visual
 import xatlas
+from scipy import ndimage
 
 try:
     import fast_simplification
@@ -30,6 +31,59 @@ def _get_device():
     if torch.backends.mps.is_available():
         return torch.device('mps')
     return torch.device('cpu')
+
+
+def _close_shell_via_voxels(
+    tm: trimesh.Trimesh,
+    resolution: int,
+    closing_iters: int,
+    project_back: float = 0.0,
+    verbose: bool = False,
+) -> trimesh.Trimesh:
+    try:
+        from skimage import measure
+    except ImportError as exc:
+        raise ImportError("close_shell requires scikit-image") from exc
+
+    extent = float(np.max(tm.extents))
+    pitch = max(extent / max(int(resolution), 1), 1e-5)
+    vox = tm.voxelized(pitch)
+
+    pad = max(2, int(closing_iters) + 2)
+    matrix = np.pad(vox.matrix.astype(bool), pad_width=pad, mode="constant", constant_values=False)
+    structure = ndimage.generate_binary_structure(3, 1)
+    if closing_iters > 0:
+        matrix = ndimage.binary_closing(matrix, structure=structure, iterations=closing_iters)
+    matrix = ndimage.binary_fill_holes(matrix)
+
+    if verbose:
+        print(
+            f"Closing shell via voxels: resolution={resolution}, pitch={pitch:.6f}, "
+            f"closing_iters={closing_iters}, grid={matrix.shape}"
+        )
+
+    verts_mc, faces_mc, _, _ = measure.marching_cubes(
+        matrix.astype(np.float32),
+        level=0.5,
+        spacing=(pitch, pitch, pitch),
+    )
+    origin = np.asarray(vox.translation, dtype=np.float32) - pad * pitch
+    verts_mc = verts_mc.astype(np.float32) + origin[None, :]
+
+    merged = trimesh.Trimesh(vertices=verts_mc, faces=faces_mc.astype(np.int64), process=False)
+    merged.remove_unreferenced_vertices()
+    trimesh.repair.fix_normals(merged)
+    if project_back > 0:
+        try:
+            from scipy.spatial import cKDTree
+            tree = cKDTree(tm.vertices)
+            _, idx = tree.query(merged.vertices, k=1)
+            nearest = tm.vertices[idx]
+            merged.vertices = merged.vertices - project_back * (merged.vertices - nearest)
+        except Exception:
+            if verbose:
+                print("Warning: failed to project closed shell back to original vertices")
+    return merged
 
 
 def _rasterize_uv_gpu(vertices, faces, uvs, texture_size, device=None):
@@ -220,6 +274,12 @@ def to_glb(
     grid_size: Union[int, list, tuple, np.ndarray, torch.Tensor] = None,
     decimation_target: int = 1000000,
     texture_size: int = 2048,
+    hole_fill_max_perimeter: float = 3e-2,
+    close_shell: bool = False,
+    close_shell_resolution: int = 192,
+    close_shell_iters: int = 1,
+    close_shell_project_back: float = 1.0,
+    force_opaque: bool = False,
     remesh: bool = False,
     remesh_band: float = 1,
     remesh_project: float = 0.9,
@@ -276,10 +336,22 @@ def to_glb(
         faces=faces.numpy(),
         process=False,
     )
-    trimesh.repair.fill_holes(tm)
+    if hole_fill_max_perimeter > 0:
+        trimesh.repair.fill_holes(tm)
     trimesh.repair.fix_normals(tm)
     if verbose:
         print(f"After hole filling: {len(tm.vertices)} vertices, {len(tm.faces)} faces")
+
+    if close_shell:
+        tm = _close_shell_via_voxels(
+            tm,
+            resolution=close_shell_resolution,
+            closing_iters=close_shell_iters,
+            project_back=close_shell_project_back,
+            verbose=verbose,
+        )
+        if verbose:
+            print(f"After shell closure: {len(tm.vertices)} vertices, {len(tm.faces)} faces")
 
     # --- Step 2: Simplification ---
     if decimation_target < len(tm.faces):
@@ -295,7 +367,8 @@ def to_glb(
         if verbose:
             print(f"After simplification: {len(tm.vertices)} vertices, {len(tm.faces)} faces")
 
-    trimesh.repair.fill_holes(tm)
+    if hole_fill_max_perimeter > 0:
+        trimesh.repair.fill_holes(tm)
     trimesh.repair.fix_normals(tm)
 
     if use_tqdm:
@@ -358,14 +431,20 @@ def to_glb(
     roughness = np.clip(attrs_full[..., attr_layout['roughness']].numpy() * 255, 0, 255).astype(np.uint8)
     alpha = np.clip(attrs_full[..., attr_layout['alpha']].numpy() * 255, 0, 255).astype(np.uint8)
 
-    # Auto-detect transparency from baked alpha values
-    alpha_valid = alpha[mask]
-    if alpha_valid.size > 0 and alpha_valid.min() < 250:
-        alpha_mode = 'BLEND'
-        if verbose:
-            print(f"Detected transparency (alpha min={alpha_valid.min()}), using BLEND mode")
-    else:
+    if force_opaque:
+        alpha[...] = 255
         alpha_mode = 'OPAQUE'
+        if verbose:
+            print("Forcing opaque material for export")
+    else:
+        # Auto-detect transparency from baked alpha values
+        alpha_valid = alpha[mask]
+        if alpha_valid.size > 0 and alpha_valid.min() < 250:
+            alpha_mode = 'BLEND'
+            if verbose:
+                print(f"Detected transparency (alpha min={alpha_valid.min()}), using BLEND mode")
+        else:
+            alpha_mode = 'OPAQUE'
 
     # Inpainting to fill UV seams
     base_color = cv2.inpaint(base_color, mask_inv, 3, cv2.INPAINT_TELEA)

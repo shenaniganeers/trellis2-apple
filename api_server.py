@@ -34,6 +34,8 @@ from PIL import Image
 from api_models import GenerateRequest, GenerateResponse, HealthResponse
 from mlx_backend import setup_logging
 
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+
 # Global pipeline instance
 pipeline = None
 
@@ -43,7 +45,8 @@ async def lifespan(app):
     global pipeline
     from mlx_backend.pipeline import create_mlx_pipeline
 
-    weights = os.environ.get("TRELLIS2_WEIGHTS", "weights/TRELLIS.2-4B")
+    default_weights = os.path.join(PROJECT_ROOT, "weights", "TRELLIS.2-4B")
+    weights = os.environ.get("TRELLIS2_WEIGHTS", default_weights)
     pipeline = create_mlx_pipeline(weights_path=weights)
     yield
     pipeline = None
@@ -156,7 +159,7 @@ def main():
     parser = argparse.ArgumentParser(description="Trellis2 MLX API Server")
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8082)
-    parser.add_argument("--weights", type=str, default="weights/TRELLIS.2-4B")
+    parser.add_argument("--weights", type=str, default=os.path.join(PROJECT_ROOT, "weights", "TRELLIS.2-4B"))
     args = parser.parse_args()
 
     os.environ["TRELLIS2_WEIGHTS"] = args.weights

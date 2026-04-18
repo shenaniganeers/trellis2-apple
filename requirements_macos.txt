@@ -9,26 +9,33 @@ safetensors
 huggingface_hub
 pillow
 numpy
+easydict
 
 # Mesh processing
 trimesh
 xatlas
 fast-simplification
 pygltflib
+plyfile
+zstandard
 
 # Image processing
 opencv-python-headless
+kornia
+timm
 
-# Server
+# Server / demo
 fastapi
 uvicorn[standard]
 pydantic>=2.0
+gradio>=6,<7
 
 # MLX (Apple Silicon native)
 mlx>=0.31.0
 
 # Metal GPU packages (Apple Silicon — install with: pip install --no-build-isolation <url>)
 mtldiffrast @ https://github.com/pedronaugusto/mtldiffrast/archive/main.tar.gz
+mtlbvh @ https://github.com/pedronaugusto/mtlbvh/archive/main.tar.gz
 cumesh @ https://github.com/pedronaugusto/mtlmesh/archive/main.tar.gz
 flex_gemm @ https://github.com/pedronaugusto/mtlgemm/archive/main.tar.gz
 
@@ -37,4 +44,5 @@ tqdm
 imageio
 imageio-ffmpeg
 scipy
+scikit-image
 einops

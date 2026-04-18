@@ -3,10 +3,19 @@ DINOv3 ViT feature extractor in MLX.
 Uses HuggingFace transformers weights but runs purely in MLX.
 """
 import math
+import os
+from pathlib import Path
+
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 from PIL import Image
+
+
+DEFAULT_DINOV3_REPO = "facebook/dinov3-vitl16-pretrain-lvd1689m"
+DINOV3_FALLBACK_REPOS = (
+    "athena2634/dinov3-vitl16-pretrain-lvd1689m",
+)
 
 
 class MlxDINOv3PatchEmbed(nn.Module):
@@ -232,8 +241,44 @@ def load_dinov3_from_hf(model_name: str = "facebook/dinov3-vitl16-pretrain-lvd16
     from huggingface_hub import hf_hub_download
     import json
 
-    config_path = hf_hub_download(model_name, "config.json")
-    weight_path = hf_hub_download(model_name, "model.safetensors")
+    override_model = os.environ.get("TRELLIS2_DINOV3_MODEL")
+    candidates = []
+    for candidate in [override_model, model_name, *DINOV3_FALLBACK_REPOS]:
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+
+    config_path = None
+    weight_path = None
+    selected_source = None
+    last_error = None
+    for candidate in candidates:
+        try:
+            candidate_path = Path(candidate)
+            if candidate_path.exists():
+                config_path = candidate_path / "config.json"
+                weight_path = candidate_path / "model.safetensors"
+                if not config_path.exists() or not weight_path.exists():
+                    raise FileNotFoundError(
+                        f"Expected config.json and model.safetensors in {candidate_path}"
+                    )
+                selected_source = str(candidate_path)
+            else:
+                config_path = hf_hub_download(candidate, "config.json")
+                weight_path = hf_hub_download(candidate, "model.safetensors")
+                selected_source = candidate
+            break
+        except Exception as exc:
+            last_error = exc
+
+    if config_path is None or weight_path is None:
+        raise RuntimeError(
+            "Unable to load DINOv3 weights. Set HF_TOKEN after being granted access "
+            f"to {model_name}, or point TRELLIS2_DINOV3_MODEL at an accessible Hugging "
+            "Face repo or local directory containing config.json and model.safetensors."
+        ) from last_error
+
+    if selected_source != model_name:
+        print(f"[MLX] Using DINOv3 weights from {selected_source}")
 
     with open(config_path) as f:
         config = json.load(f)
