@@ -19,6 +19,29 @@ https://github.com/user-attachments/assets/63b43a7e-acc7-4c81-a900-6da450527d8f
 
 This fork adds an **MLX backend** for native Apple Silicon (M-series) inference, with Metal GPU acceleration for mesh postprocessing via `mtldiffrast`, `cumesh`, and `flex_gemm`. The original CUDA pipeline is fully preserved. See `mlx_backend/` for details and `requirements_macos.txt` for macOS dependencies.
 
+### Apple Silicon Quick Start
+
+Use the macOS bootstrap script instead of the Linux/CUDA `setup.sh`:
+
+```sh
+./setup_macos.sh
+source .venv-macos/bin/activate
+python app_mlx.py
+```
+
+The script installs the macOS dependency set, builds the local `o-voxel` CPU extension, and downloads the `microsoft/TRELLIS.2-4B` snapshot into `weights/TRELLIS.2-4B`.
+
+On a fresh git checkout, `setup_macos.sh` also initializes the `o-voxel` Eigen submodule before building the local extension.
+
+If the official Hugging Face repos for DINOv3 or `RMBG-2.0` are gated in your account, the Apple path will fall back to public mirrors automatically. You can override either source explicitly with:
+
+```sh
+export TRELLIS2_DINOV3_MODEL=<hf-repo-or-local-dir>
+export TRELLIS2_RMBG_MODEL=<hf-repo-or-local-dir>
+```
+
+Transparent `RGBA` inputs skip background removal entirely, which is both faster and avoids downloading the rembg model on the first run.
+
 ## ✨ Features
 
 ### 1. High Quality, Resolution & Efficiency

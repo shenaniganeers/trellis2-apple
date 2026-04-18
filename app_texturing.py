@@ -1,7 +1,9 @@
-import gradio as gr
-
 import os
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ.setdefault("SPARSE_CONV_BACKEND", "flex_gemm")
+os.environ.setdefault("ATTN_BACKEND", "sdpa")
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
+import gradio as gr
 from datetime import datetime
 import shutil
 from typing import *
@@ -16,6 +18,14 @@ MAX_SEED = np.iinfo(np.int32).max
 TMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tmp')
 
 
+def get_best_device() -> torch.device:
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
 def start_session(req: gr.Request):
     user_dir = os.path.join(TMP_DIR, str(req.session_hash))
     os.makedirs(user_dir, exist_ok=True)
@@ -23,7 +33,8 @@ def start_session(req: gr.Request):
     
 def end_session(req: gr.Request):
     user_dir = os.path.join(TMP_DIR, str(req.session_hash))
-    shutil.rmtree(user_dir)
+    if os.path.exists(user_dir):
+        shutil.rmtree(user_dir)
 
 
 def preprocess_image(image: Image.Image) -> Image.Image:
@@ -83,7 +94,10 @@ def shapeimage_to_tex(
     os.makedirs(user_dir, exist_ok=True)
     glb_path = os.path.join(user_dir, f'sample_{timestamp}.glb')
     output.export(glb_path, extension_webp=True)
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+        torch.mps.empty_cache()
     return glb_path, glb_path
 
 
@@ -146,6 +160,6 @@ if __name__ == "__main__":
     os.makedirs(TMP_DIR, exist_ok=True)
 
     pipeline = Trellis2TexturingPipeline.from_pretrained('microsoft/TRELLIS.2-4B', config_file="texturing_pipeline.json")
-    pipeline.cuda()
+    pipeline.to(get_best_device())
     
     demo.launch()

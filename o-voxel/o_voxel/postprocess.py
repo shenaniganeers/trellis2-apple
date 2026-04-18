@@ -6,6 +6,7 @@ import cv2
 from PIL import Image
 import trimesh
 import trimesh.visual
+from scipy import ndimage
 
 import platform
 
@@ -71,6 +72,69 @@ def _grid_sample_3d(feats, coords, shape, grid, mode='trilinear'):
     return sampled.reshape(B * C, M)
 
 
+def _close_shell_via_voxels(
+    vertices: torch.Tensor,
+    faces: torch.Tensor,
+    resolution: int,
+    closing_iters: int,
+    project_back: float = 0.0,
+    bvh = None,
+    verbose: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    try:
+        from skimage import measure
+    except ImportError as exc:
+        raise ImportError("close_shell requires scikit-image") from exc
+
+    tm = trimesh.Trimesh(
+        vertices=vertices.detach().cpu().numpy(),
+        faces=faces.detach().cpu().numpy(),
+        process=False,
+    )
+    extent = float(np.max(tm.extents))
+    pitch = max(extent / max(int(resolution), 1), 1e-5)
+    vox = tm.voxelized(pitch)
+
+    pad = max(2, int(closing_iters) + 2)
+    matrix = np.pad(vox.matrix.astype(bool), pad_width=pad, mode="constant", constant_values=False)
+    structure = ndimage.generate_binary_structure(3, 1)
+    if closing_iters > 0:
+        matrix = ndimage.binary_closing(matrix, structure=structure, iterations=closing_iters)
+    matrix = ndimage.binary_fill_holes(matrix)
+
+    if verbose:
+        print(
+            f"Closing shell via voxels: resolution={resolution}, pitch={pitch:.6f}, "
+            f"closing_iters={closing_iters}, grid={matrix.shape}"
+        )
+
+    verts_mc, faces_mc, _, _ = measure.marching_cubes(
+        matrix.astype(np.float32),
+        level=0.5,
+        spacing=(pitch, pitch, pitch),
+    )
+    origin = np.asarray(vox.translation, dtype=np.float32) - pad * pitch
+    verts_mc = verts_mc.astype(np.float32) + origin[None, :]
+
+    merged = trimesh.Trimesh(vertices=verts_mc, faces=faces_mc.astype(np.int64), process=False)
+    merged.remove_unreferenced_vertices()
+    trimesh.repair.fix_normals(merged)
+    merged_vertices = torch.from_numpy(np.asarray(merged.vertices, dtype=np.float32)).to(vertices.device)
+    merged_faces = torch.from_numpy(np.asarray(merged.faces, dtype=np.int64)).to(faces.device)
+
+    if project_back > 0:
+        if bvh is None:
+            bvh = _BVH(vertices, faces)
+        if verbose:
+            print("Projecting closed shell back to original mesh...")
+        _, face_id, uvw = bvh.unsigned_distance(merged_vertices, return_uvw=True)
+        orig_tri_verts = vertices[faces[face_id.long()]]
+        projected_verts = (orig_tri_verts * uvw.unsqueeze(-1)).sum(dim=1)
+        merged_vertices -= project_back * (merged_vertices - projected_verts)
+
+    return merged_vertices, merged_faces
+
+
 def to_glb(
     vertices: torch.Tensor,
     faces: torch.Tensor,
@@ -82,6 +146,12 @@ def to_glb(
     grid_size: Union[int, list, tuple, np.ndarray, torch.Tensor] = None,
     decimation_target: int = 1000000,
     texture_size: int = 2048,
+    hole_fill_max_perimeter: float = 3e-2,
+    close_shell: bool = False,
+    close_shell_resolution: int = 192,
+    close_shell_iters: int = 1,
+    close_shell_project_back: float = 1.0,
+    force_opaque: bool = False,
     remesh: bool = False,
     remesh_band: float = 1,
     remesh_project: float = 0.9,
@@ -105,8 +175,14 @@ def to_glb(
         aabb: (2, 3) tensor of minimum and maximum coordinates of the volume
         voxel_size: (3,) tensor of size of each voxel
         grid_size: (3,) tensor of number of voxels in each dimension
-        decimation_target: target number of vertices for mesh simplification
+        decimation_target: approximate target number of output faces before UV duplication
         texture_size: size of the texture for baking
+        hole_fill_max_perimeter: largest hole perimeter to patch during cleanup; set to 0 to disable
+        close_shell: merge fragmented shells into a single closed surface before simplification
+        close_shell_resolution: voxel resolution used for shell closure
+        close_shell_iters: binary-closing iterations for shell closure
+        close_shell_project_back: blend ratio for snapping the closed shell back to the original surface
+        force_opaque: force the baked material to use alpha=255 and OPAQUE mode
         remesh: whether to perform remeshing
         remesh_band: size of the remeshing band
         remesh_project: projection factor for remeshing
@@ -125,6 +201,12 @@ def to_glb(
             coords=coords, attr_layout=attr_layout, aabb=aabb,
             voxel_size=voxel_size, grid_size=grid_size,
             decimation_target=decimation_target, texture_size=texture_size,
+            hole_fill_max_perimeter=hole_fill_max_perimeter,
+            close_shell=close_shell,
+            close_shell_resolution=close_shell_resolution,
+            close_shell_iters=close_shell_iters,
+            close_shell_project_back=close_shell_project_back,
+            force_opaque=force_opaque,
             remesh=remesh, remesh_band=remesh_band, remesh_project=remesh_project,
             verbose=verbose, use_tqdm=use_tqdm,
         )
@@ -188,12 +270,39 @@ def to_glb(
     
     # --- Initial Mesh Cleaning ---
     # Fills holes as much as we can before processing
-    mesh.fill_holes(max_hole_perimeter=3e-2)
+    if hole_fill_max_perimeter > 0:
+        mesh.fill_holes(max_hole_perimeter=hole_fill_max_perimeter)
     if verbose:
         print(f"After filling holes: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
     vertices, faces = mesh.read()
     if use_tqdm:
         pbar.update(1)
+
+    source_vertices = vertices
+    source_faces = faces
+    source_bvh = None
+    if close_shell and close_shell_project_back > 0:
+        if verbose:
+            print("Building source BVH for shell projection...", end='', flush=True)
+        source_bvh = _BVH(source_vertices, source_faces)
+        if verbose:
+            print("Done")
+
+    if close_shell:
+        if verbose:
+            print("Merging fragmented shells...")
+        vertices, faces = _close_shell_via_voxels(
+            vertices=vertices,
+            faces=faces,
+            resolution=close_shell_resolution,
+            closing_iters=close_shell_iters,
+            project_back=close_shell_project_back,
+            bvh=source_bvh,
+            verbose=verbose,
+        )
+        mesh.init(vertices, faces)
+        if verbose:
+            print(f"After shell closure: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
         
     # Build BVH for the current mesh to guide remeshing
     if use_tqdm:
@@ -222,7 +331,8 @@ def to_glb(
         mesh.remove_duplicate_faces()
         mesh.repair_non_manifold_edges()
         mesh.remove_small_connected_components(1e-5)
-        mesh.fill_holes(max_hole_perimeter=3e-2)
+        if hole_fill_max_perimeter > 0:
+            mesh.fill_holes(max_hole_perimeter=hole_fill_max_perimeter)
         if verbose:
             print(f"After initial cleanup: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
             
@@ -235,7 +345,8 @@ def to_glb(
         mesh.remove_duplicate_faces()
         mesh.repair_non_manifold_edges()
         mesh.remove_small_connected_components(1e-5)
-        mesh.fill_holes(max_hole_perimeter=3e-2)
+        if hole_fill_max_perimeter > 0:
+            mesh.fill_holes(max_hole_perimeter=hole_fill_max_perimeter)
         if verbose:
             print(f"After final cleanup: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
             
@@ -266,7 +377,8 @@ def to_glb(
         mesh.remove_duplicate_faces()
         mesh.repair_non_manifold_edges()
         mesh.remove_small_connected_components(1e-5)
-        mesh.fill_holes(max_hole_perimeter=3e-2)
+        if hole_fill_max_perimeter > 0:
+            mesh.fill_holes(max_hole_perimeter=hole_fill_max_perimeter)
         if verbose:
             print(f"After cleanup: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
 
@@ -371,14 +483,20 @@ def to_glb(
     metallic = np.clip(attrs[..., attr_layout['metallic']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
     roughness = np.clip(attrs[..., attr_layout['roughness']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
     alpha = np.clip(attrs[..., attr_layout['alpha']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
-    # Auto-detect transparency from baked alpha values
-    alpha_valid = alpha[mask]
-    if alpha_valid.size > 0 and alpha_valid.min() < 250:
-        alpha_mode = 'BLEND'
-        if verbose:
-            print(f"Detected transparency (alpha min={alpha_valid.min()}), using BLEND mode")
-    else:
+    if force_opaque:
+        alpha[...] = 255
         alpha_mode = 'OPAQUE'
+        if verbose:
+            print("Forcing opaque material for export")
+    else:
+        # Auto-detect transparency from baked alpha values
+        alpha_valid = alpha[mask]
+        if alpha_valid.size > 0 and alpha_valid.min() < 250:
+            alpha_mode = 'BLEND'
+            if verbose:
+                print(f"Detected transparency (alpha min={alpha_valid.min()}), using BLEND mode")
+        else:
+            alpha_mode = 'OPAQUE'
     
     # Inpainting: fill gaps (dilation) to prevent black seams at UV boundaries
     mask_inv = (~mask).astype(np.uint8)

@@ -10,7 +10,7 @@ repo root:
     ckpts/*.safetensors
 
 Example:
-    python export/download_weights.py --output-dir weights/TRELLIS.2-4B
+    python scripts/download_weights.py --output-dir weights/TRELLIS.2-4B
 """
 
 from __future__ import annotations

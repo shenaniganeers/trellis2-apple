@@ -16,6 +16,13 @@ __all__ = [
 ]
 
 
+def _require_cpu_extension(func_name: str) -> None:
+    if not _HAS_C or not hasattr(_C, func_name):
+        raise ImportError(
+            f"o_voxel._C is missing '{func_name}'. Reinstall o-voxel with BUILD_TARGET=cpu on macOS."
+        )
+
+
 def _init_hashmap(grid_size, capacity, device):
     VOL = (grid_size[0] * grid_size[1] * grid_size[2]).item()
 
@@ -170,6 +177,7 @@ def mesh_to_flexible_dual_grid(
     vertices = vertices - aabb[0].reshape(1, 3)
     grid_range = torch.stack([torch.zeros_like(grid_size), grid_size], dim=0).int()
     
+    _require_cpu_extension("mesh_to_flexible_dual_grid_cpu")
     ret = _C.mesh_to_flexible_dual_grid_cpu(
         vertices,
         faces,

@@ -217,6 +217,10 @@ export/coreml_models/
 
 # Generated output
 output/
+tmp/
+
+# Local Apple environment
+.venv-macos/
 
 # Debug scripts (dev-only)
 debug_*.py

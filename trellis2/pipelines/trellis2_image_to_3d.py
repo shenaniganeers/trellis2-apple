@@ -18,6 +18,13 @@ def _free_memory():
         torch.cuda.empty_cache()
     elif hasattr(torch, 'mps') and hasattr(torch.mps, 'empty_cache'):
         torch.mps.empty_cache()
+    try:
+        import mlx.core as mx
+        mx.clear_cache()
+        if hasattr(mx, 'metal') and hasattr(mx.metal, 'clear_cache'):
+            mx.metal.clear_cache()
+    except Exception:
+        pass
 
 
 class Trellis2ImageTo3DPipeline(Pipeline):
@@ -134,7 +141,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             if self.rembg_model is not None:
                 self.rembg_model.to(device)
 
-    def preprocess_image(self, input: Image.Image) -> Image.Image:
+    def preprocess_image(self, input: Image.Image, skip_background_removal: bool = False) -> Image.Image:
         """
         Preprocess the input image.
         """
@@ -150,6 +157,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             input = input.resize((int(input.width * scale), int(input.height * scale)), Image.Resampling.LANCZOS)
         if has_alpha:
             output = input
+        elif skip_background_removal:
+            output = input if input.mode == 'RGBA' else input.convert('RGBA')
         else:
             input = input.convert('RGB')
             if self.low_vram:
@@ -161,6 +170,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         output_np = np.array(output)
         alpha = output_np[:, :, 3]
         bbox = np.argwhere(alpha > 0.8 * 255)
+        if bbox.size == 0:
+            bbox = np.array([[0, 0], [output_np.shape[0] - 1, output_np.shape[1] - 1]])
         bbox = np.min(bbox[:, 1]), np.min(bbox[:, 0]), np.max(bbox[:, 1]), np.max(bbox[:, 0])
         center = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
         size = max(bbox[2] - bbox[0], bbox[3] - bbox[1])
@@ -516,6 +527,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         shape_slat_sampler_params: dict = {},
         tex_slat_sampler_params: dict = {},
         preprocess_image: bool = True,
+        skip_background_removal: bool = False,
         return_latent: bool = False,
         pipeline_type: Optional[str] = None,
         max_num_tokens: int = 49152,
@@ -531,6 +543,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             shape_slat_sampler_params (dict): Additional parameters for the shape SLat sampler.
             tex_slat_sampler_params (dict): Additional parameters for the texture SLat sampler.
             preprocess_image (bool): Whether to preprocess the image.
+            skip_background_removal (bool): Skip the rembg step even when the input has no transparency.
             return_latent (bool): Whether to return the latent codes.
             pipeline_type (str): The type of the pipeline. Options: '512', '1024', '1024_cascade', '1536_cascade'.
             max_num_tokens (int): The maximum number of tokens to use.
@@ -555,7 +568,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             raise ValueError(f"Invalid pipeline type: {pipeline_type}")
         
         if preprocess_image:
-            image = self.preprocess_image(image)
+            image = self.preprocess_image(image, skip_background_removal=skip_background_removal)
         torch.manual_seed(seed)
         cond_512 = self.get_cond([image], 512)
         cond_1024 = self.get_cond([image], 1024) if pipeline_type != '512' else None

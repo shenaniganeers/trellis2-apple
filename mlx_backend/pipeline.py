@@ -16,6 +16,12 @@ import mlx.core as mx
 
 logger = logging.getLogger(__name__)
 
+_WEIGHT_ALLOW_PATTERNS = [
+    "pipeline.json",
+    "texturing_pipeline.json",
+    "ckpts/*",
+]
+
 from . import load_safetensors, remap_flow_model_weights, remap_vae_decoder_weights
 from .flow_models import MlxSparseStructureFlowModel, MlxSLatFlowModel
 from .vae_decoders import MlxSparseUnetVaeDecoder, MlxFlexiDualGridVaeDecoder
@@ -47,6 +53,27 @@ def _resolve_model_path(weights_path: str, rel_path: str) -> str:
     if os.path.exists(f"{full}.json"):
         return full
     return _resolve_hf_path(rel_path)
+
+
+def _ensure_local_weights(weights_path: str) -> str:
+    """Ensure the local TRELLIS.2 snapshot exists for the MLX pipeline."""
+    config_file = os.path.join(weights_path, "pipeline.json")
+    if os.path.exists(config_file):
+        return weights_path
+
+    from huggingface_hub import snapshot_download
+
+    repo_id = os.environ.get("TRELLIS2_REPO_ID", "microsoft/TRELLIS.2-4B")
+    os.makedirs(weights_path, exist_ok=True)
+    logger.info("Downloading %s into %s", repo_id, weights_path)
+    snapshot_download(
+        repo_id=repo_id,
+        local_dir=weights_path,
+        local_dir_use_symlinks=False,
+        resume_download=True,
+        allow_patterns=_WEIGHT_ALLOW_PATTERNS,
+    )
+    return weights_path
 
 
 def _load_mlx_flow_model(path: str, config: dict):
@@ -175,6 +202,7 @@ def create_mlx_pipeline(weights_path: str = "weights/TRELLIS.2-4B"):
     from trellis2.pipelines import samplers
     from trellis2.pipelines.rembg import BiRefNet
 
+    weights_path = _ensure_local_weights(weights_path)
     print(f"[MLX] Loading pipeline config from {weights_path}...")
     config_file = os.path.join(weights_path, "pipeline.json")
     with open(config_file) as f:
@@ -242,6 +270,12 @@ def create_mlx_pipeline(weights_path: str = "weights/TRELLIS.2-4B"):
 def to_glb(mesh, output_path: str,
            decimation_target: int = 1000000,
            texture_size: int = 2048,
+           hole_fill_max_perimeter: float = 3e-2,
+           close_shell: bool = False,
+           close_shell_resolution: int = 192,
+           close_shell_iters: int = 1,
+           close_shell_project_back: float = 1.0,
+           force_opaque: bool = False,
            remesh: bool = False,
            verbose: bool = True) -> str:
     """Export MeshWithVoxel to GLB file."""
@@ -258,6 +292,12 @@ def to_glb(mesh, output_path: str,
         aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
         decimation_target=decimation_target,
         texture_size=texture_size,
+        hole_fill_max_perimeter=hole_fill_max_perimeter,
+        close_shell=close_shell,
+        close_shell_resolution=close_shell_resolution,
+        close_shell_iters=close_shell_iters,
+        close_shell_project_back=close_shell_project_back,
+        force_opaque=force_opaque,
         remesh=remesh,
         verbose=verbose,
     )
